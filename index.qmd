@@ -1,0 +1,447 @@
+---
+title: "Titanic Survival"
+---
+
+## Part 1. Configure your project and examine the data
+
+### 1.2. Load the required packages
+
+```{r}
+#| label: setup
+library(glmmTMB)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(broom.mixed)
+library(performance)
+library(gt)
+library(readr)
+library(DHARMa)
+library(ggeffects)
+library(titanic)
+```
+
+### 1.3. Load the dataset
+
+```{r}
+#| label: prepare-titanic
+titanic <- titanic_train |>
+  select(Survived, Sex, Age, Pclass) |>
+  drop_na() |>
+  mutate(
+    Sex.Binary = case_when(
+      Sex == "male" ~ 0,
+      Sex == "female" ~ 1
+    ),
+    Survived.Char = case_when(
+      Survived == 0 ~ "Died",
+      Survived == 1 ~ "Survived"
+    ),
+    Pclass.Char = case_when(
+      Pclass == 1 ~ "First Class",
+      Pclass == 2 ~ "Second Class",
+      Pclass == 3 ~ "Third Class"
+    ),
+    Pclass = factor(Pclass, levels = c(1, 2, 3))
+  ) |>
+  select(Survived, Survived.Char, Sex, Sex.Binary, Pclass, Pclass.Char, Age)
+
+n <- nrow(titanic)
+```
+
+The analysis uses `{r} n` passengers with complete data on survival, sex, age, and ticket class. Survival is the outcome. Sex, age, and ticket class are the predictors. Ticket class serves as a proxy for socioeconomic status.
+
+### 1.4. Explore the data
+
+#### Age
+
+```{r}
+#| label: age-summary
+age_summary <- titanic |>
+  summarise(
+    Variable = "Age (years)",
+    Mean = mean(Age),
+    SD = sd(Age),
+    Minimum = min(Age),
+    Maximum = max(Age)
+  )
+
+age_summary |>
+  gt() |>
+  tab_header(title = "Descriptive statistics for age") |>
+  fmt_number(columns = c(Mean, SD, Minimum, Maximum), decimals = 2)
+```
+
+#### Categorical variables
+
+```{r}
+#| label: categorical-counts
+survival_counts <- titanic |>
+  count(Survived.Char, name = "Count") |>
+  transmute(Variable = "Survival", Category = Survived.Char, Count)
+
+sex_counts <- titanic |>
+  count(Sex, name = "Count") |>
+  transmute(Variable = "Sex", Category = tools::toTitleCase(Sex), Count)
+
+class_counts <- titanic |>
+  count(Pclass, Pclass.Char, name = "Count") |>
+  transmute(Variable = "Ticket class", Category = Pclass.Char, Count)
+
+categorical_counts <- bind_rows(survival_counts, sex_counts, class_counts)
+
+categorical_counts |>
+  gt(groupname_col = "Variable") |>
+  tab_header(title = "Cell counts for categorical variables")
+```
+
+In this sample, there were more men (453) than women (261). The average age was 29.70 years, much younger than I expected. More passengers died (424) than survived (290).
+
+## Part 2. Specify competing binary logistic regression models
+
+### 2.1. Develop predictions
+
+<!-- Write your predictions for how sex, ticket class, and age might be associated with survival. -->
+
+### 2.2. Specify four nested models
+
+All four models use the same `{r} n` passengers. The reference categories are female and first class.
+
+```{r}
+#| label: fit-models
+# Female and first class are the reference categories.
+titanic <- titanic |>
+  mutate(Sex = factor(Sex, levels = c("female", "male")))
+
+mod0 <- glmmTMB(
+  Survived ~ 1,
+  data = titanic,
+  family = binomial(link = "logit")
+)
+
+mod1 <- glmmTMB(
+  Survived ~ Sex,
+  data = titanic,
+  family = binomial(link = "logit")
+)
+
+mod2 <- glmmTMB(
+  Survived ~ Sex + Pclass,
+  data = titanic,
+  family = binomial(link = "logit")
+)
+
+mod3 <- glmmTMB(
+  Survived ~ Sex + Pclass + Age,
+  data = titanic,
+  family = binomial(link = "logit")
+)
+```
+
+### 2.3. Explore the fitted models
+
+```{r}
+#| label: model-coefficients
+models <- list(mod0 = mod0, mod1 = mod1, mod2 = mod2, mod3 = mod3)
+
+model_coefficients <- lapply(
+  models, broom.mixed::tidy, effects = "fixed"
+) |>
+  bind_rows(.id = "Model")
+
+model_coefficients |>
+  mutate(
+    OddsRatio = if_else(term == "(Intercept)", NA_real_, exp(estimate)),
+    term = recode(
+      term,
+      "(Intercept)" = "Intercept",
+      Sexmale = "Male vs. female",
+      Pclass2 = "Second vs. first class",
+      Pclass3 = "Third vs. first class",
+      Age = "Age (per year)"
+    )
+  ) |>
+  select(Model, term, estimate, OddsRatio) |>
+  gt(groupname_col = "Model") |>
+  tab_header(title = "Logistic regression coefficients by model") |>
+  cols_label(
+    term = "Term",
+    estimate = "Estimate (log-odds)",
+    OddsRatio = "Odds ratio"
+  ) |>
+  fmt_number(columns = c(estimate, OddsRatio), decimals = 3) |>
+  sub_missing(columns = OddsRatio, missing_text = "—")
+```
+
+For predictors, an odds ratio below 1 indicates lower odds of survival, and an odds ratio above 1 indicates higher odds. Each comparison holds the other predictors in that model constant.
+
+```{r}
+#| label: model-fit-and-intercepts
+model_fit <- model_coefficients |>
+  filter(term == "(Intercept)") |>
+  transmute(Model, Intercept = estimate) |>
+  mutate(
+    Baseline = c(
+      "All passengers",
+      "Female passenger",
+      "Female passenger in first class",
+      "Female passenger in first class at age 0"
+    ),
+    AIC = sapply(models, AIC),
+    BIC = sapply(models, BIC)
+  )
+
+model_fit |>
+  gt() |>
+  tab_header(title = "Model fit and intercepts") |>
+  cols_label(Intercept = "Intercept (log-odds)") |>
+  fmt_number(columns = Intercept, decimals = 3) |>
+  fmt_number(columns = c(AIC, BIC), decimals = 1)
+```
+
+The intercept gives the estimated log-odds of survival for a female passenger in `mod1` and for a female passenger in first class in `mod2`. In `mod3`, it gives the estimated log-odds for a female passenger in first class at age zero. Age zero falls outside the observed age range, so this last baseline has limited practical meaning.
+
+## Part 3. Compare model performance
+
+### 3.1. Conduct nested-model chi-square tests
+
+```{r}
+#| label: nested-model-tests
+nested_tests <- anova(mod0, mod1, mod2, mod3)
+
+# Df is the number of fitted parameters for each model.
+nested_results <- nested_tests |>
+  mutate(Residual.df = n - Df) |>
+  select(Residual.df, `Chi Df`, Chisq, `Pr(>Chisq)`) |>
+  rename(
+    Nested.df = `Chi Df`,
+    Nested.Chisq = Chisq,
+    Nested.p = `Pr(>Chisq)`
+  )
+```
+
+### 3.2. Extract model-level performance statistics
+
+```{r}
+#| label: model-performance-metrics
+model_metrics <- bind_rows(
+  mod0 = broom.mixed::glance(mod0),
+  mod1 = broom.mixed::glance(mod1),
+  mod2 = broom.mixed::glance(mod2),
+  mod3 = broom.mixed::glance(mod3),
+  .id = "Model"
+) |>
+  mutate(Deviance = -2 * logLik) |>
+  select(Model, AIC, BIC, logLik, Deviance)
+```
+
+### 3.3. Create a combined model-comparison table
+
+```{r}
+#| label: combined-model-comparison
+# Both data frames list mod0 through mod3 in the same order.
+comparison_table <- bind_cols(model_metrics, nested_results)
+
+comparison_table |>
+  gt() |>
+  tab_header(title = "Comparison of nested logistic regression models") |>
+  cols_label(
+    logLik = "Log-likelihood",
+    Residual.df = "Residual df",
+    Nested.df = "Nested df",
+    Nested.Chisq = "Nested χ²",
+    Nested.p = "Nested p"
+  ) |>
+  fmt_number(
+    columns = c(AIC, BIC, logLik, Deviance, Nested.Chisq),
+    decimals = 2
+  ) |>
+  fmt_scientific(columns = Nested.p, decimals = 2) |>
+  sub_missing(
+    columns = c(Nested.df, Nested.Chisq, Nested.p),
+    missing_text = "—"
+  )
+```
+
+Each likelihood-ratio test compares a model with the preceding model. The dashes for `mod0` indicate that it serves as the starting model.
+
+### 3.4. Interpret the comparisons
+
+Of the four models, `mod3` had the lowest AIC (657.28) and BIC (680.14), so it offered the best balance of fit and complexity. Both scores decreased at every step from `mod0` to `mod3`. The likelihood-ratio tests supported the same pattern. Adding sex improved fit over the intercept-only model (χ²(1) = 213.82), adding ticket class improved fit beyond sex (χ²(2) = 78.27), and adding age improved fit beyond sex and ticket class (χ²(1) = 25.15). All three improvements were statistically significant (*p* < .001), and both AIC and BIC favored each addition even after accounting for the extra parameters.
+
+## Part 4. Evaluate binary logistic regression diagnostics
+
+### 4.1. Examine the assumptions
+
+The diagnostics use `mod3`, which had the lowest AIC and BIC in Part 3.
+
+#### Residual diagnostics
+
+```{r}
+#| label: simulated-residuals
+#| fig-width: 9
+#| fig-height: 5.6
+set.seed(9041)
+res_mod3 <- DHARMa::simulateResiduals(mod3, n = 500, plot = FALSE)
+plot(res_mod3)
+```
+
+#### Collinearity
+
+```{r}
+#| label: collinearity
+print(performance::check_collinearity(mod3))
+```
+
+#### Complete separation
+
+```{r}
+#| label: separation-checks
+# Check for unusually large coefficients or standard errors.
+print(summary(mod3)$coefficients$cond)
+
+# Check whether fitted probabilities are effectively 0 or 1.
+print(range(fitted(mod3)))
+```
+
+#### Potential outliers
+
+```{r}
+#| label: outliers-and-influence
+print(DHARMa::testOutliers(res_mod3, plot = FALSE))
+```
+
+#### Events per predictor coefficient
+
+```{r}
+#| label: events-per-coefficient
+n_event <- sum(titanic$Survived == 1)
+n_nonevent <- sum(titanic$Survived == 0)
+
+# Count the two ticket-class coefficients separately and exclude the intercept.
+n_coef <- length(fixef(mod3)$cond) - 1
+print(c(Survivors = n_event, Deaths = n_nonevent, Predictor.Coefficients = n_coef))
+print(c(Survivors = n_event, Deaths = n_nonevent) / n_coef)
+```
+
+### 4.2. Report the diagnostic findings
+
+The diagnostics suggest that `mod3` fits the data reasonably well. The DHARMa tests showed little evidence of uneven residual spread or excess outliers. One curve in the residual plot bent away from the expected line, suggesting the model may fit some ranges of predicted survival better than others. Collinearity was low, there were no obvious signs of complete separation, and there were enough survivors and deaths per predictor coefficient. I would keep `mod3` and interpret its results with some caution because of the bend in the residual plot.
+
+## Part 5. Select and report your preferred model
+
+### 5.1. Select a model
+
+The preferred model is `mod3`, which includes sex, ticket class, and age. It had the lowest AIC and BIC, and adding age to the model with sex and ticket class significantly improved fit (likelihood-ratio *p* < .001). The improvement justified estimating one more coefficient, and the diagnostics in Part 4 showed only a possible local mismatch in the residual plot. This model also lets me describe how each predictor is associated with survival while holding the other two constant.
+
+```{r}
+#| label: select-preferred-model
+selected_model <- mod3
+```
+
+### 5.2. Create a coefficient table
+
+```{r}
+#| label: preferred-model-coefficients
+coefficient_results <- broom.mixed::tidy(
+  selected_model,
+  effects = "fixed",
+  component = "cond",
+  conf.int = TRUE,
+  conf.level = 0.95
+) |>
+  mutate(
+    odds_ratio = exp(estimate),
+    or_low = exp(conf.low),
+    or_high = exp(conf.high)
+  )
+
+coefficient_results |>
+  select(term, estimate, std.error, conf.low, conf.high, p.value) |>
+  mutate(
+    term = recode(
+      term,
+      "(Intercept)" = "Intercept",
+      Sexmale = "Male vs. female",
+      Pclass2 = "Second vs. first class",
+      Pclass3 = "Third vs. first class",
+      Age = "Age (per year)"
+    )
+  ) |>
+  gt() |>
+  tab_header(title = "Logistic regression coefficients for mod3") |>
+  cols_label(
+    term = "Predictor",
+    estimate = "Estimate (log-odds)",
+    std.error = "SE",
+    conf.low = "95% CI lower",
+    conf.high = "95% CI upper",
+    p.value = "p"
+  ) |>
+  fmt_number(
+    columns = c(estimate, std.error, conf.low, conf.high),
+    decimals = 3
+  ) |>
+  fmt_scientific(columns = p.value, decimals = 2)
+```
+
+### 5.3. Interpret the coefficients
+
+Holding age and ticket class constant, men had lower log-odds of survival than women (coefficient = `{r} sprintf("%.3f", coefficient_results$estimate[coefficient_results$term == "Sexmale"])`) and `{r} sprintf("%.3f", coefficient_results$odds_ratio[coefficient_results$term == "Sexmale"])` times their odds of survival. At the same age and sex, second- and third-class passengers had lower log-odds of survival than first-class passengers (coefficients of `{r} sprintf("%.3f", coefficient_results$estimate[coefficient_results$term == "Pclass2"])` and `{r} sprintf("%.3f", coefficient_results$estimate[coefficient_results$term == "Pclass3"])`, respectively). Their odds were `{r} sprintf("%.3f", coefficient_results$odds_ratio[coefficient_results$term == "Pclass2"])` and `{r} sprintf("%.3f", coefficient_results$odds_ratio[coefficient_results$term == "Pclass3"])` times those of first-class passengers, respectively. Holding sex and ticket class constant, each additional year of age changed the log-odds by `{r} sprintf("%.3f", coefficient_results$estimate[coefficient_results$term == "Age"])` and multiplied the odds by `{r} sprintf("%.3f", coefficient_results$odds_ratio[coefficient_results$term == "Age"])`.
+
+### 5.4. Report overall model performance
+
+```{r}
+#| label: preferred-model-performance
+selected_row <- comparison_table |>
+  filter(Model == "mod3")
+
+selected_row |>
+  gt() |>
+  tab_header(title = "Model performance for mod3") |>
+  cols_label(
+    logLik = "Log-likelihood",
+    Residual.df = "Residual df",
+    Nested.df = "Nested df",
+    Nested.Chisq = "Nested χ²",
+    Nested.p = "Nested p"
+  ) |>
+  fmt_number(
+    columns = c(AIC, BIC, logLik, Deviance, Nested.Chisq),
+    decimals = 2
+  ) |>
+  fmt_scientific(columns = Nested.p, decimals = 2)
+```
+
+The likelihood-ratio test compares `mod3` with `mod2`.
+
+### 5.5. Summarize the results
+
+I compared four logistic regression models for survival among `{r} n` Titanic passengers. In the preferred model, men had lower survival odds than women (OR = `{r} sprintf("%.3f", coefficient_results$odds_ratio[coefficient_results$term == "Sexmale"])`, 95% CI [`{r} sprintf("%.3f", coefficient_results$or_low[coefficient_results$term == "Sexmale"])`, `{r} sprintf("%.3f", coefficient_results$or_high[coefficient_results$term == "Sexmale"])`]). Second-class (OR = `{r} sprintf("%.3f", coefficient_results$odds_ratio[coefficient_results$term == "Pclass2"])`, 95% CI [`{r} sprintf("%.3f", coefficient_results$or_low[coefficient_results$term == "Pclass2"])`, `{r} sprintf("%.3f", coefficient_results$or_high[coefficient_results$term == "Pclass2"])`]) and third-class passengers (OR = `{r} sprintf("%.3f", coefficient_results$odds_ratio[coefficient_results$term == "Pclass3"])`, 95% CI [`{r} sprintf("%.3f", coefficient_results$or_low[coefficient_results$term == "Pclass3"])`, `{r} sprintf("%.3f", coefficient_results$or_high[coefficient_results$term == "Pclass3"])`]) had lower survival odds than first-class passengers. Survival odds also decreased with each additional year of age (OR = `{r} sprintf("%.3f", coefficient_results$odds_ratio[coefficient_results$term == "Age"])`, 95% CI [`{r} sprintf("%.3f", coefficient_results$or_low[coefficient_results$term == "Age"])`, `{r} sprintf("%.3f", coefficient_results$or_high[coefficient_results$term == "Age"])`]). Each estimate accounts for the other predictors in the model.
+
+### 5.6. Visualize one predictor
+
+The plot shows predicted survival across the observed age range for female passengers in first class. The shaded area is the 95% confidence interval.
+
+```{r}
+#| label: predicted-survival-by-age
+#| fig-width: 7
+#| fig-height: 4
+pred_age <- ggeffects::ggpredict(
+  selected_model,
+  terms = "Age [all]",
+  condition = c(Sex = "female", Pclass = "1")
+)
+
+age_plot <- ggplot(pred_age, aes(x, predicted)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.18) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = scales::label_percent(), limits = c(0, 1)) +
+  labs(
+    x = "Age (years)",
+    y = "Predicted probability of survival"
+  ) +
+  theme_classic()
+
+print(age_plot)
+```
